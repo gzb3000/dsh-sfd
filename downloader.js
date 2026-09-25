@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env node
+#!/usr/bin/env node
 /**
  * SFD — Super Fast Download (downloader.js)
  * 多线程断点续传下载器 · 蒸馏自 IDM 6.42 + NDM 1.4
