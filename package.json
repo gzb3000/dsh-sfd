@@ -1,0 +1,33 @@
+{
+  "name": "sfd",
+  "version": "1.0.0",
+  "description": "Super Fast Download - multi-threaded resumable downloader with mirror acceleration. Distilled from IDM 6.42 and NDM 1.4.",
+  "main": "downloader.js",
+  "bin": {
+    "sfd": "./downloader.js"
+  },
+  "scripts": {
+    "start": "node downloader.js"
+  },
+  "keywords": [
+    "download",
+    "downloader",
+    "multi-thread",
+    "resumable",
+    "accelerator",
+    "idm",
+    "ndm",
+    "mirror",
+    "gh-proxy"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=14"
+  },
+  "files": [
+    "downloader.js",
+    "SKILL.md",
+    "README.md",
+    "LICENSE"
+  ]
+}

@@ -1,0 +1,25 @@
+# 下载残留
+*.part
+*.part.meta.json
+
+# 下载产物(测试用)
+*.exe
+*.dmg
+*.deb
+*.rpm
+
+# 依赖
+node_modules/
+
+# 日志
+*.log
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini
