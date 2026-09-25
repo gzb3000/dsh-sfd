@@ -54,17 +54,22 @@ function fmtBytes(n) {
 function nowStr() { return new Date().toLocaleTimeString('zh-CN', { hour12: false }); }
 
 function parseArgs(argv) {
-  const url = argv[2];
+  const raw = argv.slice(2);
+  // 标志位与位置参数分离,避免 --flag 被当成第 N 个位置参数
+  const flags = raw.filter(a => a.startsWith('--'));
+  const pos = raw.filter(a => !a.startsWith('--'));
+
+  const url = pos[0];
   if (!url) {
-    console.error('用法: node downloader.js <url> [输出文件] [初始线程] [端口] [最大线程] [期望SHA256]');
+    console.error('用法: node downloader.js <url> [输出文件] [初始线程] [端口] [最大线程] [期望SHA256] [--no-open]');
     process.exit(1);
   }
-  let file = argv[3];
-  const initial = parseInt(argv[4], 10) || DEFAULTS.initialThreads;
-  const port = parseInt(argv[5], 10) || DEFAULTS.port;
-  const max = parseInt(argv[6], 10) || DEFAULTS.maxThreads;
-  const sha256 = (argv[7] || '').trim().toLowerCase() || null;
-  const noOpen = argv.includes('--no-open');
+  let file = pos[1];
+  const initial = parseInt(pos[2], 10) || DEFAULTS.initialThreads;
+  const port = parseInt(pos[3], 10) || DEFAULTS.port;
+  const max = parseInt(pos[4], 10) || DEFAULTS.maxThreads;
+  const sha256 = (pos[5] || '').trim().toLowerCase() || null;
+  const noOpen = flags.includes('--no-open');
   if (!file) {
     try { file = path.basename(new URL(url).pathname) || 'download'; }
     catch { file = 'download'; }
@@ -329,6 +334,32 @@ async function streamSegment(url, seg, fd, onProgress, onFirstByte, allowFullBod
   throw lastErr;
 }
 
+/**
+ * 未知大小下载:服务器未提供 Content-Length 时,
+ * 单连接顺序拉取整个响应体,按写入偏移递增。
+ */
+async function downloadUnknownSize(url, fd, onProgress) {
+  const res = await request('GET', url, { 'User-Agent': UA });
+  if (res.statusCode !== 200 && res.statusCode !== 206) {
+    res.destroy();
+    throw new Error('HTTP ' + res.statusCode);
+  }
+  let offset = 0;
+  await new Promise((resolve, reject) => {
+    res.on('data', (chunk) => {
+      try {
+        fs.writeSync(fd, chunk, 0, chunk.length, offset);
+        offset += chunk.length;
+        if (onProgress) onProgress(chunk.length);
+      } catch (e) { if (!res.destroyed) res.destroy(); reject(e); }
+    });
+    res.on('end', resolve);
+    res.on('error', reject);
+  });
+  if (offset === 0) throw new Error('服务器返回空内容');
+  return offset;
+}
+
 // 计算文件 SHA256
 function sha256File(p) {
   return new Promise((resolve, reject) => {
@@ -365,15 +396,20 @@ async function main() {
     process.exit(1);
   }
 
-  const total = info.size;
+  let total = info.size;
   const resumable = info.acceptRanges && total > 0;
+  const unknownSize = !(total > 0);   // 服务器未提供 Content-Length
   state.total = total;
   state.status = 'downloading';
 
-  logEvent(`大小: ${fmtBytes(total)} | 断点续传: ${resumable ? '支持' : '不支持'}`);
+  logEvent(`大小: ${unknownSize ? '未知(服务器未提供 Content-Length)' : fmtBytes(total)} | 断点续传: ${resumable ? '支持' : '不支持'}`);
   if (resumable) logEvent(`线程策略: 起始 ${initial} 条 → 全部连通后扩容至 ${max} 条`);
 
-  if (!fs.existsSync(partFile) || fs.statSync(partFile).size !== total) {
+  if (unknownSize) {
+    // 未知大小:创建空文件,由写入自然增长
+    const f = fs.openSync(partFile, 'w');
+    fs.closeSync(f);
+  } else if (!fs.existsSync(partFile) || fs.statSync(partFile).size !== total) {
     const f = fs.openSync(partFile, 'w');
     fs.ftruncateSync(f, total);
     fs.closeSync(f);
@@ -382,7 +418,9 @@ async function main() {
   const fd = fs.openSync(partFile, 'r+');
 
   let segSize, segCount;
-  if (!resumable) {
+  if (unknownSize) {
+    segSize = 0; segCount = 0;
+  } else if (!resumable) {
     segSize = total; segCount = 1;
   } else {
     segSize = Math.max(DEFAULTS.minSegSize, Math.ceil(total / (max * DEFAULTS.segMultiplier)));
@@ -427,7 +465,23 @@ async function main() {
   const failedSegs = [];
   const allowFullBody = (segCount === 1);   // 单段全量下载时,200 是合法的
 
-  if (!resumable) {
+  if (unknownSize) {
+    // ---------- 未知大小:单连接流式(无法分段/续传) ----------
+    state.threads.push({ id: 0, active: true, done: false });
+    logEvent('单连接流式下载(未知大小,无法分段/续传)');
+    try {
+      const written = await downloadUnknownSize(url, fd, (n) => {
+        totalDone += n; state.done = totalDone; state.total = totalDone;
+      });
+      total = written;
+      state.total = total;
+      logEvent(`实际下载: ${fmtBytes(total)}`);
+    } catch (e) {
+      failedSegs.push(0); state.error = e.message;
+      logEvent(`⚠ 下载失败: ${e.message}`);
+    }
+    state.threads[0].active = false; state.threads[0].done = true;
+  } else if (!resumable) {
     state.threads.push({ id: 0, active: true, done: false });
     logEvent('服务器不支持 Range,降级为单线程顺序下载');
     try {
