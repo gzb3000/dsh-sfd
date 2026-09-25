@@ -1,6 +1,14 @@
 # SFD — Bilingual Description / 双语描述
 
-> 按用途分档，直接复制即可。字符数按 GitHub About 的 350 上限标注。
+---
+
+## 0. 完整描述（单段 · 先英文后中文） / Full Description (single block, EN then CN)
+
+```
+SFD (Super Fast Download) is a multi-threaded, resumable downloader distilled from the architecture of IDM 6.42 and NDM 1.4. Its first design principle is not "write a faster downloader" but "find the fastest source before downloading" — because slow downloads are 99% a source problem, not a script problem. With the same 8-thread script, a direct GitHub connection yields 0.1 MB/s while the gh-proxy.com mirror reaches 78 MB/s, roughly a 700x difference; a 1.46 GB file completes in 17.7 seconds. The engine follows four stages — probe, segment, resume, write — and starts with 8 connections, automatically expanding to 32 once all succeed. Before any download begins, it opens a live monitoring dashboard in the browser; its strict Range validation rejects the HTTP 200 full-body responses that would otherwise silently corrupt the output file; and every download can be verified against an official SHA256 digest, so a corrupt file is never delivered. Written in pure Node.js with zero dependencies, it also supports cross-process resume and exponential-backoff retry.
+
+SFD（Super Fast Download）是一个多线程断点续传下载器，蒸馏自 IDM 6.42 与 NDM 1.4 的架构原理。它的第一条设计原则不是「写个更快的下载器」，而是「下载前先找最快的源」——因为下载慢的瓶颈 99% 在源，不在脚本。同一个 8 线程脚本，GitHub 直连只有 0.1 MB/s，而 gh-proxy.com 镜像可达 78 MB/s，相差约 700 倍，1.46 GB 文件仅需 17.7 秒下完。引擎遵循「探测 → 分段 → 续传 → 落盘」四步，起始 8 条连接，全部成功后自动扩容至 32 条。在开始下载之前，它会主动在浏览器中打开实时监督看板；其严格的 Range 校验会拒绝那些会导致文件静默损坏的 HTTP 200 全量响应；每次下载都可与官方 SHA256 摘要比对，绝不交付损坏文件。纯 Node.js 标准库实现，零依赖，并支持跨进程断点续传与指数退避重试。
+```
 
 ---
 
