@@ -132,6 +132,7 @@ const state = {
 let startTime = Date.now();
 let lastDone = 0, lastSpeedTime = Date.now(), lastSpeed = 0;
 let sessionBytes = 0;   // 本次运行实际传输的字节(续传时 ≠ 文件总大小)
+let statsFrozen = false; // 传输结束后冻结统计:用时/平均速度不再随时间增长
 
 // 等待用户点击「开始下载」
 let startResolve = null;
@@ -145,6 +146,7 @@ function logEvent(msg) {
 }
 
 function updateStats() {
+  if (statsFrozen) return;   // 传输已结束 → 用时与平均速度定稿,不再随时间增长
   const n = Date.now();
   const db = state.done - lastDone;
   const dt = (n - lastSpeedTime) / 1000;
@@ -660,6 +662,15 @@ async function main() {
   fs.closeSync(fd);
   const elapsed = (Date.now() - startTime) / 1000;
 
+  // ===== 冻结统计:传输已结束,用时/平均速度在此定稿 =====
+  // 否则看板每 800ms 轮询都会用「当前时间-开始时间」重算,
+  // 导致下载完成后用时一直涨、平均速度一直掉。
+  statsFrozen = true;
+  state.elapsed = elapsed;
+  state.avgSpeed = elapsed > 0 ? sessionBytes / elapsed : 0;
+  state.sessionBytes = sessionBytes;
+  state.speed = 0;
+
   if (failedSegs.length > 0) {
     state.status = 'error';
     state.error = `${failedSegs.length} 个分段失败,重跑同一命令可续传`;
@@ -693,10 +704,8 @@ async function main() {
 
   state.status = 'done';
   state.done = total;
-  state.elapsed = elapsed;
-  state.avgSpeed = elapsed > 0 ? sessionBytes / elapsed : 0;
-  state.sessionBytes = sessionBytes;
-  updateStats();
+  state.speed = 0;
+  // 用时/平均速度已在传输结束时冻结,此处不再重算
 
   fs.renameSync(partFile, file);
   try { fs.unlinkSync(metaFile); } catch { }
@@ -706,6 +715,7 @@ async function main() {
 }
 
 main().catch(e => {
+  statsFrozen = true;   // 出错也冻结,避免用时继续增长
   state.status = 'error';
   state.error = e.message;
   console.error('\n[SFD] ❌ 错误:', e.message);
