@@ -21,7 +21,7 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { exec } = require('child_process');
+const { exec, execSync } = require('child_process');
 const { URL } = require('url');
 
 let geoMod = null;
@@ -39,7 +39,42 @@ const DEFAULTS = {
   segMultiplier: 4,
 };
 
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+// UA 候选表 —— 部分镜像(如清华 TUNA)会按 UA 拒绝"伪装成浏览器的下载工具",
+// 返回 403 并在错误页写「您访问使用的软件带有非常用软件的特点」。
+// 对策:准备多个 UA,遇到 403 自动轮换;诚实声明工具身份的 UA 通常反而能过。
+const UA_LIST = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Wget/1.21.4',
+  'curl/8.21.0',
+  'aria2/1.37.0',
+];
+let uaIndex = 0;
+let uaRotateLogged = false;   // 首次因 403 换 UA 时记一条日志,避免刷屏
+function UA() { return UA_LIST[uaIndex]; }
+function rotateUA() {
+  uaIndex = (uaIndex + 1) % UA_LIST.length;
+  state.ua = uaLabel();
+  return UA_LIST[uaIndex];
+}
+/** 短标签,便于在看板上显示当前用的是哪个 UA */
+function uaLabel() {
+  const ua = UA();
+  if (ua.includes('Chrome')) return 'Chrome';
+  if (ua.includes('Wget')) return 'Wget';
+  if (ua.includes('curl')) return 'curl';
+  if (ua.includes('aria2')) return 'aria2';
+  return ua.slice(0, 16);
+}
+
+// HTTPS 连接复用 —— 默认每条请求都新建连接(含完整 TLS 握手),
+// 128 个分段就是 128 次握手。开启 keepAlive 后握手次数降到 ≈并发数,
+// 既省时间,也减少对镜像站的连接压力(更不容易被风控)。
+// 【已弃用】keepAlive 连接池
+// 曾尝试用 http.Agent({keepAlive:true}) 复用连接以省 TLS 握手,但实测严重退化:
+//   平均 77 MB/s → 11.6 MB/s,且下载尾部卡死在 98%。
+// 原因:连接池会复用服务器已关闭的"僵尸连接",请求发进死 socket 后一直等到超时。
+// 因此改回每次新建连接。若日后重新启用,务必在收工时 agent.destroy(),
+// 否则空闲 socket 会挂 30 秒,在网络监视器里看着像"还在下载"。
 
 // ---------- 工具 ----------
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -52,6 +87,34 @@ function fmtBytes(n) {
 }
 
 function nowStr() { return new Date().toLocaleTimeString('zh-CN', { hour12: false }); }
+
+/**
+ * 检测目标文件所在磁盘的介质类型(SSD / HDD)。
+ *
+ * 为什么必须检测:多线程分段下载会让 N 条连接【同时写入文件的 N 个不同偏移】。
+ *   - SSD:随机写无寻道代价 → 多线程收益巨大
+ *   - HDD:磁头要在 N 个位置之间反复寻道 → 吞吐暴跌
+ * 实测(同一文件/同一链接/同一代码):
+ *   E盘 SSD → 18.0s / 83.41 MB/s
+ *   F盘 HDD → 63.8s / 23.50 MB/s   (慢 3.5 倍!)
+ * 因此 HDD 上必须降低并发,让写入更接近顺序。
+ */
+function detectDiskType(filePath) {
+  if (process.platform !== 'win32') return 'UNKNOWN';
+  try {
+    const letter = path.parse(path.resolve(filePath)).root.charAt(0);
+    if (!/[A-Za-z]/.test(letter)) return 'UNKNOWN';
+    const out = execSync(
+      `powershell -NoProfile -Command "(Get-PhysicalDisk -DeviceNumber (Get-Partition -DriveLetter ${letter.toUpperCase()}).DiskNumber).MediaType"`,
+      { encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'ignore'] }
+    ).trim();
+    if (/^SSD/i.test(out)) return 'SSD';
+    if (/^HDD/i.test(out)) return 'HDD';
+    return 'UNKNOWN';
+  } catch {
+    return 'UNKNOWN';
+  }
+}
 
 function parseArgs(argv) {
   const raw = argv.slice(2);
@@ -84,6 +147,10 @@ function parseArgs(argv) {
 function request(method, url, headers, redirects = 0) {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith('https') ? https : http;
+    // 注意:这里刻意【不】使用 keepAlive 连接池。
+    // 实测开启后性能严重退化(平均 77 MB/s → 11.6 MB/s,且尾部卡死) ——
+    // 原因是连接池会复用服务器已关闭的"僵尸连接",请求发进死 socket 后一直等到超时。
+    // 每次新建连接虽有 TLS 握手开销,但远好于踩僵尸连接。
     const req = lib.request(url, { method, headers, timeout: DEFAULTS.timeout }, (res) => {
       const code = res.statusCode;
       if ([301, 302, 303, 307, 308].includes(code) && res.headers.location && redirects < 10) {
@@ -99,26 +166,62 @@ function request(method, url, headers, redirects = 0) {
   });
 }
 
+/**
+ * 探测文件元信息,并在这一步确定「哪个 UA 能被服务器接受」。
+ * 部分镜像(清华 TUNA 等)会按 UA 返回 403,因此逐个 UA 试,选中第一个不被拒的。
+ */
 async function probe(url) {
-  const headers = { 'User-Agent': UA };
-  let res = await request('HEAD', url, headers);
-  let status = res.statusCode;
-  res.destroy();
-  if (status === 405 || status === 403 || status === 501) {
-    res = await request('GET', url, { ...headers, 'Range': 'bytes=0-0' });
-    status = res.statusCode;
-    const r = {
-      size: parseInt(res.headers['content-length'] || '0', 10),
-      acceptRanges: (res.headers['accept-ranges'] || '').toLowerCase() === 'bytes',
-    };
+  let last = { status: 0, size: 0, acceptRanges: false };
+
+  for (let attempt = 0; attempt < UA_LIST.length; attempt++) {
+    const headers = { 'User-Agent': UA() };
+    let res = await request('HEAD', url, headers);
+    let status = res.statusCode;
     res.destroy();
-    return { status, ...r };
+
+    // HEAD 被拒 → 用 GET + Range 0-0 再试一次(有些服务器不支持 HEAD)
+    if (status === 405 || status === 501) {
+      res = await request('GET', url, { ...headers, 'Range': 'bytes=0-0' });
+      status = res.statusCode;
+      const r = {
+        status,
+        size: parseInt(res.headers['content-length'] || '0', 10),
+        acceptRanges: (res.headers['accept-ranges'] || '').toLowerCase() === 'bytes',
+      };
+      res.destroy();
+      last = r;
+    } else {
+      last = {
+        status,
+        size: parseInt(res.headers['content-length'] || '0', 10),
+        acceptRanges: (res.headers['accept-ranges'] || '').toLowerCase() === 'bytes',
+      };
+    }
+
+    if (status === 403) {
+      logEvent(`⚠ 服务器拒绝 UA「${UA()}」(HTTP 403),换下一个 UA 重试`);
+      rotateUA();
+      continue;
+    }
+    if (status >= 400) return last;   // 其他错误直接返回,不再试
+
+    // HEAD 通过 ≠ GET 通过 —— 清华 TUNA 就是 HEAD 放行、GET 返回 403。
+    // 必须再做一次真实 GET 验证,否则开工后每条连接都要碰一次 403。
+    const vres = await request('GET', url, { ...headers, 'Range': 'bytes=0-0' });
+    const vstatus = vres.statusCode;
+    vres.destroy();
+    if (vstatus === 403) {
+      logEvent(`⚠ HEAD 放行但 GET 被拒(UA「${UA()}」),换下一个 UA 重试`);
+      rotateUA();
+      continue;
+    }
+    state.ua = uaLabel();
+    logEvent(`✅ UA 可用(GET 已验证): ${UA()}`);
+    return last;
   }
-  return {
-    status,
-    size: parseInt(res.headers['content-length'] || '0', 10),
-    acceptRanges: (res.headers['accept-ranges'] || '').toLowerCase() === 'bytes',
-  };
+
+  logEvent(`❌ 所有 UA 均被拒绝(最后一个 HTTP ${last.status})`);
+  return last;
 }
 
 // ---------- 全局状态 ----------
@@ -128,6 +231,7 @@ const state = {
   events: [], failed: 0, retries: 0,
   geo: null, vpn: null, vpnWarning: null, vpnNote: null,
   started: false, startRequested: false,
+  ua: '',   // 当前使用的 UA 短标签(看板展示)
 };
 let startTime = Date.now();
 let lastDone = 0, lastSpeedTime = Date.now(), lastSpeed = 0;
@@ -195,6 +299,9 @@ h1{font-size:20px;font-weight:600;margin-bottom:4px}
 .stat-value{font-size:19px;font-weight:600;font-family:"Cascadia Code",Consolas,monospace}
 .stat-value.speed{color:var(--accent2)}.stat-value.done{color:var(--accent)}.stat-value.left{color:var(--warn)}
 .threads-title{font-size:13px;color:var(--muted);margin-bottom:10px;display:flex;justify-content:space-between}
+.runinfo{font-size:11px;color:var(--muted);font-family:"Cascadia Code",Consolas,monospace;margin-bottom:10px;padding:6px 10px;background:#0d1117;border:1px solid var(--border);border-radius:6px}
+.runinfo b{color:var(--accent2)}
+.runinfo .warn{color:var(--warn)}
 .threads{display:grid;grid-template-columns:repeat(auto-fill,minmax(52px,1fr));gap:6px;margin-bottom:18px}
 .thread{background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:6px 2px;text-align:center;font-size:10px;font-family:"Cascadia Code",Consolas,monospace;color:var(--muted)}
 .thread.active{border-color:var(--accent);color:var(--accent)}
@@ -230,6 +337,7 @@ h1{font-size:20px;font-weight:600;margin-bottom:4px}
 <div class="stat"><div class="stat-label">平均速度</div><div class="stat-value" id="avg">—</div></div>
 </div>
 <div class="threads-title"><span>连接状态</span><span id="thcount"></span></div>
+<div class="runinfo" id="runinfo"></div>
 <div class="threads" id="threads"></div>
 <div class="logbox" id="logbox"></div>
 <div class="footer">SFD · 内置 HTTP 服务驱动</div></div>
@@ -292,6 +400,9 @@ function poll(){fetch('/api/state').then(r=>r.json()).then(s=>{
     tc.appendChild(d);
   });
   document.getElementById('thcount').textContent='共 '+(s.threads||[]).length+' 条 · 活跃 '+act;
+  var ri=document.getElementById('runinfo');
+  var rt=s.retries||0, fl=s.failed||0;
+  ri.innerHTML='UA: <b>'+(s.ua||'—')+'</b>  ·  重试: <span class="'+(rt>0?'warn':'')+'">'+rt+'</span>  ·  失败分段: <span class="'+(fl>0?'warn':'')+'">'+fl+'</span>';
   var lb=document.getElementById('logbox');
   lb.innerHTML=(s.events||[]).map(function(e){return '<div>'+e+'</div>'}).join('');
   lb.scrollTop=lb.scrollHeight;
@@ -338,18 +449,33 @@ function openDashboard(port) {
  * 流式下载一个分段。
  * 防护: ① 请求了 Range 就必须 206,非 206 丢弃重试 ② chunk 夹紧到分段边界 ③ 分段字节数校验
  */
-async function streamSegment(url, seg, fd, onProgress, onFirstByte, allowFullBody) {
+async function streamSegment(url, seg, fd, onProgress, onConnected, allowFullBody) {
   const want = seg.end - seg.start + 1;
   let offset = seg.start;
   let received = 0;
   let lastErr;
+  let connected = false;
 
   for (let attempt = 0; attempt <= DEFAULTS.retries; attempt++) {
     try {
-      const headers = { 'Range': `bytes=${offset}-${seg.end}`, 'User-Agent': UA };
+      const headers = { 'Range': `bytes=${offset}-${seg.end}`, 'User-Agent': UA() };
       const res = await request('GET', url, headers);
 
       const isFullBody = res.statusCode === 200;
+      if (res.statusCode === 403) {
+        // UA 被拒 —— 轮换 UA 后立刻重试(标记 is403,跳过退避等待)
+        res.destroy();
+        const oldUA = UA();
+        rotateUA();
+        if (!uaRotateLogged) {
+          uaRotateLogged = true;
+          logEvent(`⚠ 分段请求被 403,UA 已从「${oldUA.slice(0, 30)}…」切换为「${UA()}」`);
+        }
+        state.ua = uaLabel();
+        const err = new Error(`UA 被拒(403),已换为「${UA()}」`);
+        err.is403 = true;
+        throw err;
+      }
       if (res.statusCode !== 206 && res.statusCode !== 200) {
         res.destroy();
         throw new Error('HTTP ' + res.statusCode);
@@ -359,7 +485,10 @@ async function streamSegment(url, seg, fd, onProgress, onFirstByte, allowFullBod
         throw new Error('服务器忽略了 Range 请求(返回 200 全量),已丢弃并重试');
       }
 
-      let firstByteSeen = false;
+      // ===== 连接已建立(拿到合法响应头)即视为连通 =====
+      // 不等首字节 —— 否则服务器慢热时扩容会被无谓拖延(实测拖了 19 秒)
+      if (!connected) { connected = true; if (onConnected) onConnected(); }
+
       await new Promise((resolve, reject) => {
         res.on('data', (chunk) => {
           try {
@@ -370,7 +499,6 @@ async function streamSegment(url, seg, fd, onProgress, onFirstByte, allowFullBod
             offset += data.length;
             received += data.length;
             if (onProgress) onProgress(data.length);
-            if (!firstByteSeen) { firstByteSeen = true; if (onFirstByte) onFirstByte(); }
           } catch (e) { if (!res.destroyed) res.destroy(); reject(e); }
         });
         res.on('end', resolve);
@@ -384,6 +512,9 @@ async function streamSegment(url, seg, fd, onProgress, onFirstByte, allowFullBod
       state.retries++;
       if (received >= want) return;
       if (attempt < DEFAULTS.retries) {
+        // 403 是「换 UA 就能解决」的问题,不需要退避等待 —— 立刻重试
+        if (e.is403) continue;
+        // 连接失败/超时/200 异常等,需要退避让服务器或网络恢复
         await sleep(DEFAULTS.retryBackoff[Math.min(attempt, DEFAULTS.retryBackoff.length - 1)]);
       }
     }
@@ -392,7 +523,7 @@ async function streamSegment(url, seg, fd, onProgress, onFirstByte, allowFullBod
 }
 
 async function downloadUnknownSize(url, fd, onProgress) {
-  const res = await request('GET', url, { 'User-Agent': UA });
+  const res = await request('GET', url, { 'User-Agent': UA() });
   if (res.statusCode !== 200 && res.statusCode !== 206) { res.destroy(); throw new Error('HTTP ' + res.statusCode); }
   let offset = 0;
   await new Promise((resolve, reject) => {
@@ -474,7 +605,31 @@ async function main() {
   state.total = total;
 
   logEvent(`大小: ${unknownSize ? '未知' : fmtBytes(total)} | 断点续传: ${resumable ? '支持' : '不支持'}`);
-  if (resumable) logEvent(`线程策略: 起始 ${initial} 条 → 全部连通后扩容至 ${max} 条`);
+
+  // ===== 磁盘类型检测:HDD 上必须禁用多线程 =====
+  // 多线程 = N 条连接同时写文件的不同偏移。
+  //   SSD:随机写无寻道代价 → 多线程收益巨大
+  //   HDD:磁头在 N 个位置之间反复寻道 → 吞吐暴跌,反而不如单连接顺序写
+  // 实测(F盘 HDD,同一文件/同一链接/同一代码):
+  //   1 连接 → 15.0s / 100.16 MB/s   ← 最快
+  //   2 连接 → 52.8s /  28.35 MB/s
+  //   4 连接 → 47.8s /  31.38 MB/s
+  //  32 连接 → 63.8s /  23.50 MB/s
+  // 故 HDD 强制单连接。
+  const diskType = detectDiskType(file);
+  let effInitial = initial;
+  let effMax = max;
+  if (diskType === 'HDD') {
+    effInitial = 1;
+    effMax = 1;
+    logEvent(`💽 目标磁盘: HDD(机械硬盘) —— 分段并发写会触发磁头寻道抖动`);
+    logEvent(`   实测: 1 连接 100 MB/s vs 4 连接 31 MB/s vs 32 连接 23 MB/s`);
+    logEvent(`   → 强制单连接(顺序写最快),禁用 8→32 扩容`);
+  } else {
+    logEvent(`💽 目标磁盘: ${diskType}${diskType === 'SSD' ? '(随机写无寻道代价,适合多线程)' : ''}`);
+  }
+
+  if (resumable) logEvent(`线程策略: 起始 ${effInitial} 条 → 全部连通后扩容至 ${effMax} 条`);
 
   // ===== ④ 等待用户点击「开始下载」 =====
   if (!autoStart) {
@@ -504,7 +659,7 @@ async function main() {
   if (unknownSize) { segSize = 0; segCount = 0; }
   else if (!resumable) { segSize = total; segCount = 1; }
   else {
-    segSize = Math.max(DEFAULTS.minSegSize, Math.ceil(total / (max * DEFAULTS.segMultiplier)));
+    segSize = Math.max(DEFAULTS.minSegSize, Math.ceil(total / (effMax * DEFAULTS.segMultiplier)));
     segCount = Math.ceil(total / segSize);
   }
   const segments = [];
@@ -580,8 +735,8 @@ async function main() {
       const thisRound = queue;
       queue = [];
 
-      const concStart = round === 1 ? initial : Math.max(2, Math.floor(initial / 2));
-      const concMax = round === 1 ? max : Math.max(4, Math.floor(max / 4));
+      const concStart = round === 1 ? effInitial : Math.max(2, Math.floor(effInitial / 2));
+      const concMax = round === 1 ? effMax : Math.max(4, Math.floor(effMax / 4));
 
       if (round > 1) {
         logEvent(`🔁 第 ${round} 轮:重试 ${thisRound.length} 个分段(并发降至 ${concStart}~${concMax},先等 3 秒)`);
@@ -627,13 +782,13 @@ async function main() {
       }
 
       function maybeEscalate() {
-        if (round !== 1 || escalated) return;   // 只有第一轮做 8→32 扩容
-        if (provenCount >= initial) {
+        if (round !== 1 || escalated) return;   // 只有第一轮做扩容
+        if (provenCount >= effInitial) {
           escalated = true;
-          const extra = max - initial;
+          const extra = effMax - effInitial;
           if (extra > 0) {
-            logEvent(`✅ 前 ${initial} 条连接全部成功收到数据 → 扩容至 ${max} 条`);
-            for (let k = 0; k < extra; k++) spawnWorker(initial + k);
+            logEvent(`✅ 前 ${effInitial} 条连接全部成功收到数据 → 扩容至 ${effMax} 条`);
+            for (let k = 0; k < extra; k++) spawnWorker(effInitial + k);
           }
         }
       }
@@ -647,7 +802,7 @@ async function main() {
         await Promise.all(batch);
       }
 
-      if (round === 1 && !escalated) logEvent(`未触发扩容(仅 ${provenCount}/${initial} 条连接成功收流)`);
+      if (round === 1 && !escalated) logEvent(`未触发扩容(仅 ${provenCount}/${effInitial} 条连接成功收流)`);
 
       queue = roundFailures;
       if (queue.length) logEvent(`第 ${round} 轮结束,仍有 ${queue.length} 个分段未完成`);
