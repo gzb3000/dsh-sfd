@@ -127,7 +127,7 @@ const state = {
   speed: 0, avgSpeed: 0, elapsed: 0, error: '', threads: [],
   events: [], failed: 0, retries: 0,
   geo: null, vpn: null, vpnWarning: null, vpnNote: null,
-  started: false,
+  started: false, startRequested: false,
 };
 let startTime = Date.now();
 let lastDone = 0, lastSpeedTime = Date.now(), lastSpeed = 0;
@@ -236,10 +236,9 @@ function fmtB(n){if(n==null||isNaN(n))return'—';if(n>=1073741824)return(n/1073
 function fmtT(s){if(!s||s<0)return'—';s=Math.floor(s);var h=Math.floor(s/3600),m=Math.floor((s%3600)/60),x=s%60;if(h>0)return h+'时'+m+'分'+x+'秒';if(m>0)return m+'分'+x+'秒';return x+'秒'}
 function doStart(){
   var b=document.getElementById('startbtn');
-  b.disabled=true;b.textContent='正在启动...';
-  fetch('/api/start').then(function(r){return r.json()}).then(function(){
-    document.getElementById('startbox').style.display='none';
-  }).catch(function(){b.disabled=false;b.textContent='▶ 开 始 下 载';});
+  b.disabled=true;b.textContent='⏳ 正在启动...';
+  // 只发请求;按钮的真实状态由服务端 startRequested 决定(poll 会在 800ms 内纠正)
+  fetch('/api/start').then(function(r){return r.json()}).catch(function(){});
 }
 function poll(){fetch('/api/state').then(r=>r.json()).then(s=>{
   document.getElementById('filename').textContent=s.file||'未知文件';
@@ -251,7 +250,13 @@ function poll(){fetch('/api/state').then(r=>r.json()).then(s=>{
   else if(s.status==='waiting'){st.className='status-badge status-waiting';st.textContent='⏸ 等待确认'}
   else{st.className='status-badge status-downloading';st.textContent='⬇ 下载中'}
 
-  document.getElementById('startbox').style.display=(s.status==='waiting')?'block':'none';
+  var waiting=(s.status==='waiting');
+  document.getElementById('startbox').style.display=waiting?'block':'none';
+  if(waiting){
+    var b=document.getElementById('startbtn');
+    if(s.startRequested){b.disabled=true;b.textContent='⏳ 正在启动...'}
+    else{b.disabled=false;b.textContent='▶ 开 始 下 载'}
+  }
 
   if(s.vpnWarning){
     document.getElementById('vpnbanner').style.display='block';
@@ -304,6 +309,7 @@ function startHttpServer(port) {
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify(state));
       } else if (u === '/api/start') {
+        state.startRequested = true;
         if (startResolve) { startResolve(); startResolve = null; }
         state.started = true;
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
